@@ -16,15 +16,21 @@ So, per hour h, we fit on the comparable launches:
 
     log(viewers_h / viewers_1) = a_h + b_h * log(viewers_1)
 
-with the slope split the way the data splits it: ~0 for hours 2-5 (pre-US,
-the night dip is size-independent), one shared slope for hours 6-11 (US
-unlock and morning), one shared slope for hours 12-24 (US daytime/evening,
-where the size effect is strongest, about -0.5). The pool is restricted to
+with the slope ramping with the hour: the per-hour raw slopes (each fit
+on the pool's launches at that hour alone) are smoothed by a least-squares
+line over hours 5..24, b_h = clip(alpha + beta*h, -1, 0), and b_h = 0 for
+hours 2-4 (pre-US, the night dip is size-independent). The raw slopes rise
+in magnitude through the day (about -0.26 at hour 5 to about -0.53 at
+hour 24 on the final pool) because the size effect is the US-unlock wave:
+a launch whose hour 1 is already huge is saturated from the start, while
+a small hour 1 grows all day as time zones unlock. Starting the slope at
+hour 5 instead of 6 matters (the first unlock wave lands in hour 5), and
+the ramp beats two shared slopes on validation. The pool is restricted to
 launches that share GTA VI's unlock shape -- midnight-local rolling unlock,
 no early access -- because simultaneous-unlock and early-access launches
 have a different skeleton (their hour 1 is not a launch hour at all). The
 residual spread around the fit (pooled across hours) sets the quantile
-bands, scaled by 0.9.
+bands, scaled by 0.7.
 
 Two guards against the one way this can go wrong:
   - the size anchor is clamped to the pool's observed hour-1 range. The
@@ -38,16 +44,49 @@ Two guards against the one way this can go wrong:
 
 Validation (local, on the kit's own practice cases, answers fetched from
 SullyGnome, the same public source the case data comes from; the 4th
-practice launch, Spider-Man 2, could not be fetched, so n = 3):
+practice launch, Spider-Man 2, could not be fetched -- SullyGnome returns
+no average-viewer data for it in Oct 2023 -- so n = 3):
   house persistence baseline  mean pinball loss 0.415
-  median-ratio model          mean pinball loss 0.302
-  this model (main.py)        mean pinball loss 0.145
-    per case: Wolverine 0.199, Red Dead Redemption 2 0.110,
-    God of War Ragnarok 0.126
-Leave-one-out over the 8 similar comparables: baseline 0.418, this model
-0.301. In the final case the pool also carries the 4 practice launches
-(12 clean launches), which can only help. Deterministic, standard library
-only, no network.
+  median-ratio model          mean pinball loss 0.284
+  v1 (two shared slopes, spread 0.9, 8-launch pool)
+                              mean pinball loss 0.139
+    per case: Wolverine 0.192, Red Dead Redemption 2 0.105,
+    God of War Ragnarok 0.120
+  v2 (this file)              mean pinball loss 0.118
+    per case: Wolverine 0.158, Red Dead Redemption 2 0.091,
+    God of War Ragnarok 0.105
+Leave-one-out over the 11 similar comparables: v1 0.301, v2 0.243
+(excluding the two shape outliers, Resident Evil Requiem and Final Fantasy
+VII Rebirth, whose release days do not share GTA VI's unlock shape:
+v1 0.167, v2 0.144). In the final case the pool also carries the 4
+practice launches (15 clean launches), which can only help.
+Deterministic, standard library only, no network.
+
+What changed from v1 to v2, and why (each change measured on the same
+practice + leave-one-out protocol; only measured wins shipped):
+  - Pool 8 -> 11 launches. (a) The early-access test is negation-aware:
+    "no early access" no longer counts as early access, which restores
+    Call of Duty: Modern Warfare 4 (midnight local rolling, no early
+    access). (b) Two named additions, each validated individually to
+    improve both the practice mean and leave-one-out: Call of Duty:
+    Black Ops 6 (CoD norm is midnight local rolling; its campaign early
+    access preceded launch, it does not contaminate the release day) and
+    Ghost of Tsushima (Sony single-player launch, midnight local expected
+    like Final Fantasy VII Rebirth / The Last of Us Part II, which are
+    already in the pool). Both improve other launches' leave-one-out
+    folds, not just their own.
+  - Slopes: two shared slopes -> a ramp. Per-hour raw slopes smoothed by
+    a least-squares line over hours 5..24 (alpha about -0.19, beta about
+    -0.015 on the final pool; stable across pool sizes, no clipping).
+  - Slope starts at hour 5, not 6: the first unlock wave lands in hour 5.
+  - SPREAD 0.9 -> 0.7: the validation optimum is a broad plateau from
+    0.6 to 0.75 on both practice and leave-one-out; 0.7 sits in its
+    middle. (Per-block and per-hour residual SDs, empirical residual
+    quantiles, median-ratio ensembling, intercept smoothing, and wider
+    pools were all tried and did not improve both metrics, so none
+    shipped. Excluding the Resident Evil Requiem outlier from the pool
+    was tried and hurts: it is the strongest small-hour-1 / big-growth
+    example the slope is estimated from.)
 """
 
 import json
@@ -65,7 +104,7 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
 SIGMA = 0.15          # fallback persistence spread (log units per sqrt hour)
-SPREAD = 0.9          # multiplier on the residual SD for the quantile bands
+SPREAD = 0.7          # multiplier on the residual SD for the quantile bands
 MIN_CLEAN_POOL = 5    # below this, widen the pool to all launch comparables
 MIN_HOURS = 12        # a comparable must have this many of hours 2..24
 
@@ -105,7 +144,24 @@ def is_rolling_midnight(comp):
 
 def has_early_access(comp):
     u = _unlock(comp)
+    # "no early access" is a denial, not an early access: Call of Duty:
+    # Modern Warfare 4 ("Midnight local Oct 23 (rolling), no early
+    # access") was wrongly excluded by the plain substring test.
+    if "no early access" in u or "without early access" in u or "no early-access" in u:
+        return False
     return "early access" in u or "early-access" in u
+
+
+# Launches the rolling-midnight filter misses but the validation says
+# belong in the pool. Each was tested individually on the practice +
+# leave-one-out protocol and improves both; both improve other launches'
+# leave-one-out folds, not just their own. See the module docstring.
+POOL_ALLOWLIST = frozenset({
+    "Call of Duty: Black Ops 6",  # CoD norm is midnight local rolling;
+    # its campaign early access preceded launch.
+    "Ghost of Tsushima",  # Sony single-player launch, midnight local
+    # expected like FF VII Rebirth / The Last of Us Part II.
+})
 
 
 def is_target_prelaunch(comp):
@@ -135,6 +191,14 @@ def clean_pool(case):
         u = _usable(c)
         if u is not None:
             pool.append(u)
+    # Named additions the filter misses (see POOL_ALLOWLIST above).
+    have = {c.get("name") for c, _ in pool}
+    for c in case.get("comparables", []):
+        if c.get("name") in POOL_ALLOWLIST and c.get("name") not in have:
+            u = _usable(c)
+            if u is not None:
+                pool.append(u)
+                have.add(c.get("name"))
     if len(pool) < MIN_CLEAN_POOL:
         pool = []
         for c in case.get("comparables", []):
@@ -165,14 +229,30 @@ def _pooled_slope(pool, hlo, hhi):
 
 
 def fit(pool):
-    """Per-hour intercepts and the two shared slopes; pooled residual SD."""
-    be = _pooled_slope(pool, 6, 11)
-    bl = _pooled_slope(pool, 12, 24)
+    """Ramp size slopes + per-hour intercepts + pooled residual SD.
+
+    Per-hour raw slopes (each fit on the pool's launches at that hour
+    alone) are smoothed by a least-squares line over hours 5..24; the
+    slope is 0 for hours 2-4. The line borrows strength across hours, so
+    the noisy single-hour estimates (11 launches each) do not drive the
+    forecast; the fitted line is stable across pool sizes (alpha about
+    -0.19, beta about -0.015) and never hits the clip bounds.
+    """
+    raw = {}
+    for h in range(5, 25):
+        raw[h] = _pooled_slope(pool, h, h)
+    hs = list(range(5, 25))
+    mh = sum(hs) / len(hs)
+    mr = sum(raw[h] for h in hs) / len(hs)
+    cov = sum((h - mh) * (raw[h] - mr) for h in hs)
+    vx = sum((h - mh) ** 2 for h in hs)
+    beta = cov / vx if vx > 0 else 0.0
+    alpha = mr - beta * mh
 
     def b_of(h):
-        if h < 6:
+        if h < 5:
             return 0.0
-        return be if h <= 11 else bl
+        return max(-1.0, min(0.0, alpha + beta * h))
 
     a = {}
     for h in range(2, 25):
